@@ -1,8 +1,8 @@
 # ShareChat Creator & Content Engagement Analytics
 
-**Product Analyst Internship Portfolio Project**
+**Product Analyst Portfolio Project**
 
-A complete, end-to-end product analytics system built to demonstrate the skills required for the ShareChat Product Analyst Intern role — SQL depth, metric design, cohort thinking, A/B test evaluation, and analytical storytelling.
+A complete, end-to-end product analytics system built to demonstrate the skills required for the Product Analyst Intern role — SQL depth, metric design, cohort thinking, A/B test evaluation, and analytical storytelling.
 
 > **Scoping note:** This is a deliberate **product analytics** project, not a data science project. No ML models. The questions a PM needs answered — who's churning, where's the funnel drop-off, does this feature work — are better answered by well-written SQL and clear metric definitions than by a black-box model. That scoping decision is itself a talking point.
 

@@ -42,3 +42,6 @@ data/warehouse/data_quality_report.txt
 
 # Streamlit cache
 .streamlit/
+
+
+.docs/INTERVIEW_PREP.md

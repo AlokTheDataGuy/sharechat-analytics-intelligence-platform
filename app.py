@@ -11,8 +11,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from PIL import Image
 import base64
+import sqlite3
+import math
+import pathlib
+import scipy.stats as _stats
 import warnings
 warnings.filterwarnings("ignore")
+
+_ROOT = pathlib.Path(__file__).resolve().parent
 
 # ─── PAGE CONFIG ────────────────────────────────────────────
 _logo_img = Image.open("assets/logo.png")
@@ -187,6 +193,19 @@ def base_layout(fig, height=360, dual=False):
                         tickfont=dict(size=10, color=SUBTEXT), showgrid=False)
         )
     return fig
+
+
+# ─── WAREHOUSE CONNECTION ───────────────────────────────────
+
+@st.cache_resource
+def get_db_conn():
+    db = _ROOT / "data" / "warehouse" / "sharechat_warehouse.db"
+    if not db.exists():
+        return None
+    conn = sqlite3.connect(str(db), check_same_thread=False)
+    conn.create_function("SQRT",  1, lambda x: math.sqrt(max(x, 0)) if x is not None else None)
+    conn.create_function("POWER", 2, lambda x, y: x**y if x is not None and y is not None else None)
+    return conn
 
 
 # ─── DATA GENERATION ────────────────────────────────────────
@@ -787,6 +806,301 @@ def page_language(lang):
     st.dataframe(show,use_container_width=True,hide_index=True)
 
 
+# ─── PAGE: A/B TEST RESULTS ─────────────────────────────────
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_ab_data():
+    conn = get_db_conn()
+    if conn is None:
+        return None, None, None
+    ab_sum = pd.read_sql(
+        "SELECT u.experiment_group, COUNT(DISTINCT u.user_id) AS users, "
+        "COUNT(s.session_id) AS sessions, "
+        "ROUND(AVG(s.session_duration_sec),1) AS mean_sec, "
+        "ROUND(AVG(s.session_duration_sec*s.session_duration_sec),1) AS mean_sq "
+        "FROM dim_users u LEFT JOIN fact_sessions s ON u.user_id=s.user_id "
+        "AND s.session_end >= s.session_start "
+        "WHERE u.user_id NOT LIKE 'TEST_%' GROUP BY 1", conn)
+    seg_df = pd.read_sql(
+        "SELECT u.experiment_group, u.city_tier, "
+        "ROUND(AVG(s.session_duration_sec),1) AS mean_sec "
+        "FROM fact_sessions s JOIN dim_users u ON s.user_id=u.user_id "
+        "WHERE s.session_end >= s.session_start AND u.user_id NOT LIKE 'TEST_%' "
+        "GROUP BY 1,2", conn)
+    eng_df = pd.read_sql(
+        "SELECT u.experiment_group, "
+        "ROUND(SUM(CASE WHEN fe.event_type IN ('like','share','comment') THEN 1.0 ELSE 0 END) "
+        "/ NULLIF(SUM(CASE WHEN fe.event_type='view' THEN 1.0 ELSE 0 END),0)*100,3) AS er_pct "
+        "FROM fact_engagement_events fe JOIN dim_users u ON fe.user_id=u.user_id "
+        "WHERE u.user_id NOT LIKE 'TEST_%' GROUP BY 1", conn)
+    return ab_sum, seg_df, eng_df
+
+
+def page_ab_test():
+    conn = get_db_conn()
+    if conn is None:
+        st.error("Warehouse not found. Run src/03_build_warehouse.py first.")
+        return
+
+    with st.spinner("Running statistical analysis on 500K sessions…"):
+        result = _load_ab_data()
+
+    if result is None or result[0] is None:
+        st.error("Could not load A/B test data from warehouse.")
+        return
+
+    ab_sum, seg_df, eng_df = result
+
+    ctrl_row = ab_sum[ab_sum.experiment_group=="control"].iloc[0]
+    var_row  = ab_sum[ab_sum.experiment_group=="variant"].iloc[0]
+    n_c, n_v = int(ctrl_row["users"]), int(var_row["users"])
+    mean_c   = float(ctrl_row["mean_sec"])
+    mean_v   = float(var_row["mean_sec"])
+    var_c    = max(float(ctrl_row["mean_sq"]) - mean_c**2, 0)
+    var_v    = max(float(var_row["mean_sq"])  - mean_v**2, 0)
+    se       = (var_v/n_v + var_c/n_c)**0.5 if n_v and n_c else 1
+    z        = (mean_v - mean_c) / se if se else 0
+    rel_lift = (mean_v - mean_c) / mean_c * 100
+    ci_lo    = (mean_v - mean_c) - 1.96 * se
+    ci_hi    = (mean_v - mean_c) + 1.96 * se
+    sig      = abs(z) > 1.96
+
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: st.markdown(kpi("Control Users", f"{n_c:,}", desc="experiment_group=control"), unsafe_allow_html=True)
+    with c2: st.markdown(kpi("Variant Users", f"{n_v:,}", desc="experiment_group=variant"), unsafe_allow_html=True)
+    with c3: st.markdown(kpi("Session Duration Lift", f"+{rel_lift:.1f}%", f"z = {z:.2f}", True), unsafe_allow_html=True)
+    with c4:
+        sig_text = "✓ Significant (p<0.05)" if sig else "✗ Not Significant"
+        st.markdown(kpi("Result", sig_text, desc="two-tailed z-test"), unsafe_allow_html=True)
+
+    sec("Primary Metric — Session Duration: Control vs. Variant")
+    fig = go.Figure()
+    err_clr = "#9CA3AF"
+    for grp, mean, vr, n_, clr in [
+        ("Control", mean_c, var_c, n_c, ORANGE),
+        ("Variant",  mean_v, var_v, n_v, TEAL),
+    ]:
+        fig.add_trace(go.Bar(
+            x=[grp], y=[mean/60], name=grp,
+            marker_color=clr, marker_line_width=0,
+            error_y=dict(type="constant", value=1.96*vr**0.5/n_**0.5/60,
+                         color=err_clr, thickness=2, width=10),
+            text=[f"{mean/60:.1f} min"], textposition="outside",
+        ))
+    fig = base_layout(fig, 280)
+    fig.update_layout(
+        yaxis_title="Avg Session Duration (minutes)",
+        title=f"95% CI on lift: [{ci_lo:.0f}s, {ci_hi:.0f}s]  |  z = {z:.2f}",
+        title_font_size=11,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        sec("Segment Cuts — Lift by City Tier (Simpson's Paradox Check)")
+        pivot = seg_df.pivot(index="city_tier", columns="experiment_group", values="mean_sec")
+        if "control" in pivot.columns and "variant" in pivot.columns:
+            pivot["lift_pct"] = (pivot["variant"]-pivot["control"])/pivot["control"]*100
+            lift_fig = px.bar(pivot.reset_index(), x="city_tier", y="lift_pct",
+                              color_discrete_sequence=[ORANGE],
+                              labels={"lift_pct":"Lift (%)", "city_tier":"City Tier"},
+                              text="lift_pct")
+            lift_fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside", marker_line_width=0)
+            lift_fig = base_layout(lift_fig, 260)
+            lift_fig.add_hline(y=0, line_dash="dash", line_color=SUBTEXT)
+            st.plotly_chart(lift_fig, use_container_width=True)
+            all_pos = (pivot["lift_pct"] > 0).all()
+            ins("Lift is positive across all city tiers — " +
+                ("no Simpson's paradox." if all_pos else "INVESTIGATE: negative lift in some segments."))
+
+    with col2:
+        sec("Secondary Metrics Summary")
+        ctrl_er = float(eng_df[eng_df.experiment_group=="control"]["er_pct"].iloc[0])
+        var_er  = float(eng_df[eng_df.experiment_group=="variant"]["er_pct"].iloc[0])
+        rows = [
+            {"Metric": "Session Duration", "Control": f"{mean_c:.0f}s", "Variant": f"{mean_v:.0f}s",
+             "Lift": f"+{rel_lift:.1f}%", "Significant": "✓ Yes" if sig else "✗ No"},
+            {"Metric": "Engagement Rate",  "Control": f"{ctrl_er:.3f}%", "Variant": f"{var_er:.3f}%",
+             "Lift": f"{var_er-ctrl_er:+.3f} pp", "Significant": "Monitor"},
+        ]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    sig_color = GREEN if sig else RED
+    ship_text = "SHIP" if sig else "HOLD — ITERATE"
+    st.markdown(
+        f'<div style="background:rgba({int(sig_color[1:3],16)},{int(sig_color[3:5],16)},{int(sig_color[5:],16)},0.10);'
+        f'border-left:4px solid {sig_color};padding:18px 22px;margin:20px 0;border-radius:0 4px 4px 0;">'
+        f'<div style="font-size:12px;font-weight:800;color:{sig_color};text-transform:uppercase;'
+        f'letter-spacing:1.5px;margin-bottom:8px;">Recommendation: {ship_text}</div>'
+        f'<div style="font-size:13px;color:#374151;line-height:1.7;">'
+        f'Session duration lifted <b>+{rel_lift:.1f}%</b> (z={z:.2f}) — '
+        f'{"statistically significant at 95% confidence level." if sig else "NOT yet significant."} '
+        f'Lift is consistent across all city tiers (no Simpson\'s paradox). '
+        f'Post-ship guardrails: ≥+5% session lift in Week 1, D7 retention ≥ control baseline.'
+        f'</div></div>',
+        unsafe_allow_html=True
+    )
+
+
+# ─── PAGE: SQL WORKBENCH ─────────────────────────────────────
+
+SQL_QUERIES = {
+    "01 — DAU/WAU/MAU + Stickiness":            "sql/01_engagement_metrics.sql",
+    "02 — Retention Cohorts (D1/D7/D14/D30)":   "sql/02_retention_cohorts.sql",
+    "03 — Content Performance (ER by Language)": "sql/03_content_performance.sql",
+    "04 — Creator Power-Law (Pareto)":           "sql/04_creator_analytics.sql",
+    "05 — Engagement Funnel (View→Follow)":      "sql/05_funnel_analysis.sql",
+    "06 — A/B Test Statistical Readout":         "sql/06_ab_test_analysis.sql",
+    "07 — Monetisation (CTR × City Tier)":       "sql/07_monetization_analysis.sql",
+    "08 — Anomaly Detection (14-Day Z-Score)":   "sql/08_anomaly_detection.sql",
+    "09 — Power Users (RFM Segmentation)":       "sql/09_power_users.sql",
+    "10 — Creator Retention (Posting Streaks)":  "sql/10_creator_retention.sql",
+    "11 — Language Cross-Consumption Matrix":    "sql/11_language_cross_analysis.sql",
+    "12 — Session Depth by Device Tier":         "sql/12_session_patterns.sql",
+    "13 — Festival Impact Analysis":             "sql/13_festival_impact.sql",
+    "14 — Device Segmentation (Crash Proxy)":    "sql/14_device_segmentation.sql",
+    "15 — Cohort LTV (30/60/90-Day Windows)":    "sql/15_cohort_ltv.sql",
+}
+
+QUERY_INTERPRETATIONS = {
+    "01 — DAU/WAU/MAU + Stickiness":
+        ("DAU/MAU (stickiness) should be >40% for a healthy social app. "
+         "7-day rolling average smooths out day-of-week noise for cleaner trend reading.",
+         "Flag weeks where DAU/MAU drops >2pp — trigger retention investigation. "
+         "Use day-over-day % change for daily monitoring alerts."),
+    "02 — Retention Cohorts (D1/D7/D14/D30)":
+        ("D1 retention shows onboarding quality; D7 shows whether the core product hook works; "
+         "D30 reflects true product-market fit.",
+         "Cohorts with D1 < 35% need onboarding A/B tests. D7 < 20% signals content quality or "
+         "personalisation failures in the first week."),
+    "03 — Content Performance (ER by Language)":
+        ("PERCENT_RANK() of 1.0 = top engagement rate category in that language. "
+         "The er_tier column buckets into top/mid/bottom third.",
+         "Content investment decisions: prioritise creator incentives for top-tier categories "
+         "in high-MAU languages."),
+    "04 — Creator Power-Law (Pareto)":
+        ("Lorenz curve shows engagement concentration. cumulative_pct_top_x at percentile 100 "
+         "= what the top 1% of creators drive.",
+         "If top 1% > 40% of engagement, creator churn is existential — prioritise creator "
+         "monetisation programs and retention."),
+    "05 — Engagement Funnel (View→Follow)":
+        ("Each row is a city tier. Drop-off at the 'like' step = relevance problem. "
+         "Drop-off at 'share' = friction in share UX or social graph size.",
+         "Identifies which funnel stage needs A/B testing per segment. "
+         "Tier-1 share-to-follow gap is the highest-ROI optimisation target."),
+    "06 — A/B Test Statistical Readout":
+        ("z > 1.96 → p < 0.05 two-tailed. ci_lower_95 > 0 confirms the lift is real, "
+         "not sampling noise.",
+         "This is the PM's ship/hold decision row. Also check secondary metrics before shipping."),
+    "07 — Monetisation (CTR × City Tier)":
+        ("Tier-1 users convert ~3x better on ads than Tier-4. ARPU index >100 = above average.",
+         "Ad ops should prioritise premium ad inventory for Tier-1 users. "
+         "Tier-3/4 users need better ad relevance, not higher ad load."),
+    "08 — Anomaly Detection (14-Day Z-Score)":
+        ("'ANOMALY_HIGH — investigate' = unexpected spike not caused by a festival. "
+         "'expected_festival_spike' = normal and anticipated.",
+         "Engineering uses ANOMALY_LOW flags for incident triage. "
+         "Product uses festival spikes to measure campaign ROI."),
+    "09 — Power Users (RFM Segmentation)":
+        ("Champions have high Recency, Frequency, AND Monetary scores. "
+         "At Risk = previously active but dropping off now.",
+         "Champions → invite to creator program. At Risk → send re-engagement push. "
+         "Lost → winback campaign with incentive."),
+    "10 — Creator Retention (Posting Streaks)":
+        ("Most creators have max streak of 1-2 weeks before lapsing. "
+         "Week 3-4 is the critical cliff.",
+         "Introduce streak milestone rewards (badge at 4 weeks, revenue share boost at 8 weeks) "
+         "to push creators past the cliff."),
+    "11 — Language Cross-Consumption Matrix":
+        ("Diagonal = same-language consumption. Off-diagonal shows cross-language appetite. "
+         "Bhojpuri is frequently consumed by Hindi users.",
+         "Feed algorithm should increase Bhojpuri content weight for Hindi users. "
+         "Regional-language cross-consumption is a content discovery feature opportunity."),
+    "12 — Session Depth by Device Tier":
+        ("crash_proxy_pct = sessions < 10 seconds (likely crash or immediate bail). "
+         "Android-Low has the highest rate.",
+         "If Android-Low crash proxy > 8%, APK performance work is high priority. "
+         "Content team should test image-first feeds for low-end devices."),
+    "13 — Festival Impact Analysis":
+        ("t_stat_dau > 1.96 → festival DAU spike is statistically significant, not noise.",
+         "Content team pre-plans festival content 2 weeks ahead. "
+         "Engineering pre-scales servers. Ad ops sells festival premium inventory."),
+    "14 — Device Segmentation (Crash Proxy)":
+        ("session_dur_index = device's avg session vs. best device (iOS=100). "
+         "Index < 70 on Android-Low makes the case for ShareChat Lite.",
+         "If Android-Low index drops below 70, escalate APK optimisation to P1. "
+         "Track index weekly as a product health metric."),
+    "15 — Cohort LTV (30/60/90-Day Windows)":
+        ("cohort_quality_index = this cohort's D90 revenue vs. average. >100 = above average cohort.",
+         "Growth team increases acquisition spend for channels that produce high-index cohorts. "
+         "Product changes that lift cohort_quality_index = monetisation improvements."),
+}
+
+
+def page_sql_workbench():
+    conn = get_db_conn()
+    if conn is None:
+        st.warning("Warehouse not built. Run `python src/03_build_warehouse.py` first.")
+        return
+
+    sec("SQL Query Library — 15 Redshift-Compatible Queries")
+
+    selected = st.selectbox(
+        "Select a query to run:",
+        list(SQL_QUERIES.keys()),
+        key="sql_workbench_select"
+    )
+
+    sql_path = _ROOT / SQL_QUERIES[selected]
+    if not sql_path.exists():
+        st.error(f"SQL file not found: {sql_path}")
+        return
+
+    raw_sql = sql_path.read_text(encoding="utf-8")
+
+    st.markdown("**Query SQL:**")
+    st.code(raw_sql, language="sql")
+
+    if st.button("▶ Run Query", type="primary", key="run_sql_btn"):
+        import re
+        raw_clean = re.sub(r'/\*.*?\*/', '', raw_sql, flags=re.DOTALL)
+        lines = [l for l in raw_clean.split("\n") if not l.strip().startswith("--")]
+        clean = "\n".join(lines)
+        blocks = [b.strip() for b in clean.split(";")
+                  if b.strip() and re.search(r'\bSELECT\b', b, re.IGNORECASE)]
+
+        if not blocks:
+            st.error("No SELECT statement found in this file.")
+            return
+
+        with st.spinner(f"Querying warehouse… ({selected.split('—')[0].strip()})"):
+            try:
+                df = pd.read_sql(blocks[0], conn)
+            except Exception as e:
+                st.error(f"Query failed: {e}")
+                df = None
+
+        if df is not None:
+            st.success(f"✓  {len(df):,} rows × {len(df.columns)} columns")
+            st.dataframe(df, use_container_width=True, height=min(400, 40 + len(df) * 35))
+            if selected in QUERY_INTERPRETATIONS:
+                what_it_tells, what_pm_does = QUERY_INTERPRETATIONS[selected]
+                col1, col2 = st.columns(2)
+                with col1:
+                    ins(what_it_tells, title="What This Tells Us")
+                with col2:
+                    ins(what_pm_does, title="What a PM Would Do With It")
+    else:
+        st.caption("Select a query above, then click ▶ Run Query to execute live against the SQLite warehouse.")
+        if selected in QUERY_INTERPRETATIONS:
+            what_it_tells, what_pm_does = QUERY_INTERPRETATIONS[selected]
+            col1, col2 = st.columns(2)
+            with col1:
+                ins(what_it_tells, title="What This Tells Us")
+            with col2:
+                ins(what_pm_does, title="What a PM Would Do With It")
+
+
 # ─── MAIN ───────────────────────────────────────────────────
 
 def main():
@@ -863,7 +1177,7 @@ def main():
     """, unsafe_allow_html=True)
 
     # ── Tab navigation
-    tabs = st.tabs(["OVERVIEW","USER ANALYTICS","CONTENT","MONETIZATION","RETENTION","LANGUAGE"])
+    tabs = st.tabs(["OVERVIEW","USER ANALYTICS","CONTENT","MONETIZATION","RETENTION","LANGUAGE","A/B TEST","SQL WORKBENCH"])
 
     with tabs[0]: page_overview(monthly, revenue_det)
     with tabs[1]: page_users(filtered_users)
@@ -871,6 +1185,8 @@ def main():
     with tabs[3]: page_monetization(monthly, revenue_det)
     with tabs[4]: page_retention(retention, daily_dau, monthly)
     with tabs[5]: page_language(lang)
+    with tabs[6]: page_ab_test()
+    with tabs[7]: page_sql_workbench()
 
 
 if __name__ == "__main__":

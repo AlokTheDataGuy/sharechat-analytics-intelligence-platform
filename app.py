@@ -23,7 +23,7 @@ _ROOT = pathlib.Path(__file__).resolve().parent
 # ─── PAGE CONFIG ────────────────────────────────────────────
 _logo_img = Image.open("assets/logo.png")
 st.set_page_config(
-    page_title="ShareChat Analytics Platform",
+    page_title="ShareChat Content Engagement Analytics",
     page_icon=_logo_img,
     layout="wide",
     initial_sidebar_state="expanded",   # filters always visible on load
@@ -811,45 +811,64 @@ def page_language(lang):
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_ab_data():
     conn = get_db_conn()
-    if conn is None:
-        return None, None, None
-    ab_sum = pd.read_sql(
-        "SELECT u.experiment_group, COUNT(DISTINCT u.user_id) AS users, "
-        "COUNT(s.session_id) AS sessions, "
-        "ROUND(AVG(s.session_duration_sec),1) AS mean_sec, "
-        "ROUND(AVG(s.session_duration_sec*s.session_duration_sec),1) AS mean_sq "
-        "FROM dim_users u LEFT JOIN fact_sessions s ON u.user_id=s.user_id "
-        "AND s.session_end >= s.session_start "
-        "WHERE u.user_id NOT LIKE 'TEST_%' GROUP BY 1", conn)
-    seg_df = pd.read_sql(
-        "SELECT u.experiment_group, u.city_tier, "
-        "ROUND(AVG(s.session_duration_sec),1) AS mean_sec "
-        "FROM fact_sessions s JOIN dim_users u ON s.user_id=u.user_id "
-        "WHERE s.session_end >= s.session_start AND u.user_id NOT LIKE 'TEST_%' "
-        "GROUP BY 1,2", conn)
-    eng_df = pd.read_sql(
-        "SELECT u.experiment_group, "
-        "ROUND(SUM(CASE WHEN fe.event_type IN ('like','share','comment') THEN 1.0 ELSE 0 END) "
-        "/ NULLIF(SUM(CASE WHEN fe.event_type='view' THEN 1.0 ELSE 0 END),0)*100,3) AS er_pct "
-        "FROM fact_engagement_events fe JOIN dim_users u ON fe.user_id=u.user_id "
-        "WHERE u.user_id NOT LIKE 'TEST_%' GROUP BY 1", conn)
+    if conn is not None:
+        ab_sum = pd.read_sql(
+            "SELECT u.experiment_group, COUNT(DISTINCT u.user_id) AS users, "
+            "COUNT(s.session_id) AS sessions, "
+            "ROUND(AVG(s.session_duration_sec),1) AS mean_sec, "
+            "ROUND(AVG(s.session_duration_sec*s.session_duration_sec),1) AS mean_sq "
+            "FROM dim_users u LEFT JOIN fact_sessions s ON u.user_id=s.user_id "
+            "AND s.session_end >= s.session_start "
+            "WHERE u.user_id NOT LIKE 'TEST_%' GROUP BY 1", conn)
+        seg_df = pd.read_sql(
+            "SELECT u.experiment_group, u.city_tier, "
+            "ROUND(AVG(s.session_duration_sec),1) AS mean_sec "
+            "FROM fact_sessions s JOIN dim_users u ON s.user_id=u.user_id "
+            "WHERE s.session_end >= s.session_start AND u.user_id NOT LIKE 'TEST_%' "
+            "GROUP BY 1,2", conn)
+        eng_df = pd.read_sql(
+            "SELECT u.experiment_group, "
+            "ROUND(SUM(CASE WHEN fe.event_type IN ('like','share','comment') THEN 1.0 ELSE 0 END) "
+            "/ NULLIF(SUM(CASE WHEN fe.event_type='view' THEN 1.0 ELSE 0 END),0)*100,3) AS er_pct "
+            "FROM fact_engagement_events fe JOIN dim_users u ON fe.user_id=u.user_id "
+            "WHERE u.user_id NOT LIKE 'TEST_%' GROUP BY 1", conn)
+        return ab_sum, seg_df, eng_df
+
+    # Synthetic fallback (deterministic seed — used when DB not available)
+    np.random.seed(99)
+    n_c, n_v = 48_312, 49_105
+    mean_c, std_c = 478.3, 142.6
+    mean_v, std_v = 512.7, 138.9
+    ctrl_sess = np.random.normal(mean_c, std_c, n_c)
+    var_sess  = np.random.normal(mean_v, std_v, n_v)
+    ab_sum = pd.DataFrame({
+        "experiment_group": ["control", "variant"],
+        "users":    [n_c, n_v],
+        "sessions": [n_c * 8, n_v * 8],
+        "mean_sec": [ctrl_sess.mean(), var_sess.mean()],
+        "mean_sq":  [(ctrl_sess**2).mean(), (var_sess**2).mean()],
+    })
+    tiers = ["Tier-1", "Tier-2", "Tier-3", "Tier-4"]
+    ctrl_tier = [mean_c * f for f in [1.12, 1.04, 0.97, 0.91]]
+    var_tier  = [mean_v * f for f in [1.13, 1.05, 0.98, 0.92]]
+    seg_rows = []
+    for t, mc, mv in zip(tiers, ctrl_tier, var_tier):
+        seg_rows.append({"experiment_group": "control", "city_tier": t, "mean_sec": round(mc, 1)})
+        seg_rows.append({"experiment_group": "variant",  "city_tier": t, "mean_sec": round(mv, 1)})
+    seg_df = pd.DataFrame(seg_rows)
+    eng_df = pd.DataFrame({
+        "experiment_group": ["control", "variant"],
+        "er_pct": [7.841, 8.203],
+    })
     return ab_sum, seg_df, eng_df
 
 
 def page_ab_test():
-    conn = get_db_conn()
-    if conn is None:
-        st.error("Warehouse not found. Run src/03_build_warehouse.py first.")
-        return
-
     with st.spinner("Running statistical analysis on 500K sessions…"):
-        result = _load_ab_data()
+        ab_sum, seg_df, eng_df = _load_ab_data()
 
-    if result is None or result[0] is None:
-        st.error("Could not load A/B test data from warehouse.")
-        return
-
-    ab_sum, seg_df, eng_df = result
+    if get_db_conn() is None:
+        st.info("Live warehouse not available on this deployment — showing results computed from synthetic experiment data (same methodology).", icon="ℹ️")
 
     ctrl_row = ab_sum[ab_sum.experiment_group=="control"].iloc[0]
     var_row  = ab_sum[ab_sum.experiment_group=="variant"].iloc[0]
@@ -1039,11 +1058,16 @@ QUERY_INTERPRETATIONS = {
 
 def page_sql_workbench():
     conn = get_db_conn()
-    if conn is None:
-        st.warning("Warehouse not built. Run `python src/03_build_warehouse.py` first.")
-        return
+    db_available = conn is not None
 
     sec("SQL Query Library — 15 Redshift-Compatible Queries")
+
+    if not db_available:
+        st.info(
+            "Live query execution requires the local SQLite warehouse. "
+            "Browse the SQL and interpretations below — all queries are Redshift-compatible and run against the full 2M-row schema.",
+            icon="ℹ️"
+        )
 
     selected = st.selectbox(
         "Select a query to run:",
@@ -1172,7 +1196,7 @@ def main():
     st.markdown(f"""
     <div class="dash-hdr">
       <img src="data:image/png;base64,{b64}" style="width:38px;height:38px;border-radius:8px;flex-shrink:0;">
-      <span class="dash-ttl">ShareChat &nbsp;·&nbsp; Analytics Intelligence Platform</span>
+      <span class="dash-ttl">ShareChat &nbsp;·&nbsp; Content Engagement Analytics</span>
     </div>
     """, unsafe_allow_html=True)
 

@@ -230,4 +230,4 @@ sharechat-analytics/
 Built as a portfolio project for the **ShareChat Product Analyst Internship**.
 All data is synthetic; behavioural signals are modelled on publicly documented platform dynamics.
 
-[LinkedIn](#) · [Portfolio](#) · [Email](#)
+[LinkedIn](https://www.linkedin.com/in/alokthedataguy/) · [Portfolio](#) · [Email](alokdeep9925@gmail.com)

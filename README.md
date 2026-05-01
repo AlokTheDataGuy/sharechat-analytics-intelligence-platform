@@ -1,14 +1,15 @@
 <div align="center">
   <img src="assets/logo.png" width="72" alt="ShareChat logo"/>
 
-  <h1>ShareChat Content Engagement Analytics</h1>
+  <h1>ShareChat Analytics Intelligence Platform</h1>
 
   <p><strong>An end-to-end product analytics system for a regional-language social platform — built to demonstrate the SQL depth, metric design, and analytical storytelling expected of a Product Analyst.</strong></p>
 
   <p>
     <img src="https://img.shields.io/badge/SQL-Redshift--compatible-blue" alt="SQL"/>
     <img src="https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white" alt="Python"/>
-    <img src="https://img.shields.io/badge/Streamlit-FF4B4B?logo=streamlit&logoColor=white" alt="Streamlit"/>
+    <img src="https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white" alt="React"/>
+    <img src="https://img.shields.io/badge/FastAPI-0.111-009688?logo=fastapi&logoColor=white" alt="FastAPI"/>
     <img src="https://img.shields.io/badge/Rows-2.97M-success" alt="Rows"/>
     <img src="https://img.shields.io/badge/SQL%20Queries-15-orange" alt="Queries"/>
   </p>
@@ -20,40 +21,9 @@
 
 Most "product analyst" portfolios are a Kaggle dataset, three charts in a notebook, and a short writeup. That doesn't mirror the actual job.
 
-This project does. It generates a 3M-row synthetic event warehouse modeled on a real social platform's data shape, lands it in a star schema, runs 15 Redshift-compatible SQL queries against it, evaluates an A/B test with proper statistical rigor, and surfaces the findings through both a multi-page dashboard and a PM-style memo with concrete recommendations.
+This project does. It generates a 3M-row synthetic event warehouse modeled on a real social platform's data shape, lands it in a star schema, runs 15 Redshift-compatible SQL queries against it, evaluates an A/B test with proper statistical rigor, and surfaces the findings through a production-grade React dashboard with a FastAPI backend.
 
-> **Scoping note.** This is deliberately a **product analytics** project, not a data science one. No ML models, no predictions. The questions a PM actually needs answered — *who's churning, where's the funnel drop-off, does this feature work* — are better answered with well-written SQL and clear metric definitions than with a black-box model. That scoping decision is itself a deliberate signal.
-
----
-
-## Dashboard Preview
-
-<table>
-  <tr>
-    <td width="50%"><img src="screenshots/OVERVIEW.png" alt="Overview"/></td>
-    <td width="50%"><img src="screenshots/USER_STRATEGY.png" alt="User Analytics"/></td>
-  </tr>
-  <tr>
-    <td><strong>Overview</strong> — Platform KPIs, revenue trend, MAU by platform</td>
-    <td><strong>User Analytics</strong> — Language mix, device split, session behaviour</td>
-  </tr>
-  <tr>
-    <td><img src="screenshots/CONTENT.png" alt="Content"/></td>
-    <td><img src="screenshots/MONETIZATION.png" alt="Monetisation"/></td>
-  </tr>
-  <tr>
-    <td><strong>Content</strong> — Engagement rate by type, category market map</td>
-    <td><strong>Monetisation</strong> — Revenue by format, eCPM trend, QoQ waterfall</td>
-  </tr>
-  <tr>
-    <td><img src="screenshots/RETENTION.png" alt="Retention"/></td>
-    <td><img src="screenshots/LANGUAGE.png" alt="Language"/></td>
-  </tr>
-  <tr>
-    <td><strong>Retention</strong> — Cohort heatmap, DAU trend, retention curve</td>
-    <td><strong>Language</strong> — MAU, engagement, and revenue across 15 languages</td>
-  </tr>
-</table>
+> **Scoping note.** This is deliberately a **product analytics** project, not a data science one. No ML models, no predictions. The questions a PM actually needs answered — *who's churning, where's the funnel drop-off, does this feature work* — are better answered with well-written SQL and clear metric definitions than with a black-box model.
 
 ---
 
@@ -76,44 +46,134 @@ The full reasoning, segment breakdowns, and recommended product actions live in 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                                                                         │
-│   01_generate_data.py     →    /data/raw/*.csv      (2.97M rows)        │
-│        (NumPy, vectorised)                                              │
-│                                                                         │
-│   02_simulate_api_fetch.py  →  paginated fetch, retry, dedupe           │
-│        (mirrors a real "fetch from internal events API" workflow)       │
-│                                                                         │
-│   03_build_warehouse.py   →   /data/warehouse/sharechat.db              │
-│        (SQLite + 18 indexes; Redshift DISTKEY/SORTKEY documented)       │
-│                                                                         │
-│   04_data_quality_checks.py  →  8 DQ categories, written report         │
-│                                                                         │
-│         ↓                          ↓                          ↓         │
-│   sql/01–15_*.sql         notebooks/*.ipynb           dashboard/app.py  │
-│   (Redshift-compat)       (EDA + A/B + creator)       (8-page Streamlit)│
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+pipeline/                         # Data generation & warehouse build
+  01_generate_data.py    ──►  data/raw/*.csv          (2.97M rows, ~20s)
+  02_simulate_api_fetch.py ──► paginated fetch, retry, dedupe
+  03_build_warehouse.py  ──►  data/warehouse/sharechat.db   (star schema)
+  04_data_quality_checks.py ──► 8 DQ categories, written report
+
+sql/                              # 15 Redshift-compatible analytical queries
+notebooks/                        # EDA, A/B deep-dive, creator ecosystem
+
+backend/                          # FastAPI — serves the warehouse over REST
+  app/api/routes/                 # overview, users, content, monetisation,
+                                  # language, retention, ab_test, query
+  app/core/cache.py               # permanent process-level cache (no TTL)
+  app/core/database.py            # SQLite + WAL + 256MB mmap pragmas
+
+frontend/                         # React 18 + Vite + TypeScript + Tailwind
+  src/pages/                      # 8 dashboard pages
+  src/components/                 # KPICard, charts, layout, UI primitives
+  src/services/api.ts             # typed fetch layer
+  src/hooks/useAPI.ts             # loading/error state hook
 ```
 
-**Star schema.** Fact tables (`events`, `sessions`, `ad_impressions`) join to dimensions (`users`, `creators`, `posts`). Designed so every SQL query in `/sql` would work unchanged on Redshift; the SQLite layer is just for portability.
+**Star schema.** Fact tables (`fact_events`, `fact_sessions`, `fact_ad_impressions`) join to dimensions (`dim_users`, `dim_creators`, `dim_posts`). Every SQL query in `/sql` runs unchanged on Redshift; SQLite is used for portability.
+
+---
+
+## Run It
+
+### Prerequisites
+
+- Python 3.10+
+- Node.js 18+
+
+### 1 — Build the warehouse
+
+```bash
+cd pipeline
+pip install -r requirements.txt
+
+python 01_generate_data.py        # ~20s  → data/raw/
+python 02_simulate_api_fetch.py   # ~70s  → paginate, dedupe, refresh
+python 03_build_warehouse.py      # ~35s  → data/warehouse/sharechat.db
+python 04_data_quality_checks.py  # ~10s  → DQ report
+```
+
+### 2 — Start the backend
+
+```bash
+start_backend.bat
+# or manually: cd backend && uvicorn app.main:app --reload
+# API available at http://localhost:8000
+```
+
+### 3 — Start the frontend
+
+```bash
+start_frontend.bat
+# or manually: cd frontend && npm install && npm run dev
+# Dashboard at http://localhost:5173
+```
+
+### Optional — Notebooks
+
+```bash
+cd pipeline
+jupyter lab ../notebooks/
+```
+
+---
+
+## Project Structure
+
+```
+sharechat-analytics/
+├── assets/                       # Logo and brand assets
+├── backend/                      # FastAPI application
+│   ├── app/
+│   │   ├── api/routes/           # REST endpoints (8 modules)
+│   │   ├── core/
+│   │   │   ├── cache.py          # Permanent in-process cache
+│   │   │   └── database.py       # SQLite connection + pragmas
+│   │   └── main.py
+│   └── requirements.txt
+├── data/
+│   ├── raw/                      # Generated CSVs (gitignored)
+│   └── warehouse/                # SQLite DB (gitignored)
+├── docs/                         # Schema, data dictionary, interview prep
+├── frontend/                     # React + Vite + TypeScript dashboard
+│   ├── public/logo.png
+│   ├── src/
+│   │   ├── components/           # KPICard, Sidebar, LoadingState, UI
+│   │   ├── hooks/useAPI.ts
+│   │   ├── pages/                # Overview, UserAnalytics, Content,
+│   │   │                         # Monetisation, Retention, Language,
+│   │   │                         # ABTest, SQLWorkbench
+│   │   └── services/api.ts
+│   ├── index.html
+│   └── package.json
+├── notebooks/                    # EDA, A/B deep-dive, creator ecosystem
+├── pipeline/                     # Data generation scripts
+│   ├── 01_generate_data.py
+│   ├── 02_simulate_api_fetch.py
+│   ├── 03_build_warehouse.py
+│   ├── 04_data_quality_checks.py
+│   └── requirements.txt
+├── reports/                      # Product memo, metrics definitions
+├── sql/                          # 15 analytical queries + README
+├── start_backend.bat
+├── start_frontend.bat
+└── README.md
+```
 
 ---
 
 ## What's Inside
 
-### Data & Pipeline (`src/`)
+### Pipeline (`pipeline/`)
 
-| File | Purpose |
-|------|---------|
-| `01_generate_data.py` | Vectorised generation of 2.97M rows across 7 tables — 50K users, 5K creators, 100K posts, 2M events, 500K sessions, 300K ad impressions. Behaviour modelled on publicly documented platform dynamics (tier effects, festival spikes, device-class drop-offs). |
-| `02_simulate_api_fetch.py` | Simulates paginated API fetch with retry/backoff/deduplication — directly answers the JD's *"scripting to fetch from API endpoints"* requirement. |
-| `03_build_warehouse.py` | Loads CSVs into a SQLite star schema with 18 indexes; Redshift equivalents (`DISTKEY`, `SORTKEY`, `DISTSTYLE ALL`) documented inline. |
-| `04_data_quality_checks.py` | 8-category DQ suite: row counts, nulls, referential integrity, date validity, duplicates, test-user filtering, enum validation, distribution sanity. Outputs a written report. |
+| Script | Purpose |
+|--------|---------|
+| `01_generate_data.py` | Vectorised generation of 2.97M rows across 7 tables — 50K users, 5K creators, 100K posts, 2M events, 500K sessions, 300K ad impressions. |
+| `02_simulate_api_fetch.py` | Simulates paginated API fetch with retry/backoff/deduplication. |
+| `03_build_warehouse.py` | Loads CSVs into a SQLite star schema with 18 indexes; Redshift equivalents documented inline. |
+| `04_data_quality_checks.py` | 8-category DQ suite: nulls, referential integrity, date validity, duplicates, enum validation, distribution sanity. |
 
 ### SQL (`sql/`)
 
-15 Redshift-compatible analytical queries, each paired with a business question and recommended PM action in `sql/README.md`:
+15 Redshift-compatible queries, each paired with a business question and PM action in `sql/README.md`:
 
 ```
 01_engagement_metrics.sql        09_power_users.sql
@@ -126,88 +186,33 @@ The full reasoning, segment breakdowns, and recommended product actions live in 
 08_anomaly_detection.sql
 ```
 
-Heavy use of window functions, CTEs, conditional aggregates, and statistical computation in pure SQL.
-
 ### Notebooks (`notebooks/`)
 
-| Notebook | What it covers |
-|----------|----------------|
-| `01_exploratory_analysis.ipynb` | User distributions, session shape, festival effect, A/B preview |
-| `02_ab_test_deep_dive.ipynb` | Power check → t-test → CI → segment cuts → Simpson's-paradox check → ship/no-ship recommendation |
-| `03_creator_ecosystem.ipynb` | Power-law fit, Lorenz curve & Gini, streak analysis, category health |
+| Notebook | Coverage |
+|----------|---------|
+| `01_exploratory_analysis.ipynb` | User distributions, session shape, festival effect |
+| `02_ab_test_deep_dive.ipynb` | Power check → t-test → CI → segment cuts → ship recommendation |
+| `03_creator_ecosystem.ipynb` | Power-law fit, Lorenz curve & Gini, streak analysis |
 
-### Dashboard (`dashboard/app.py`)
+### Dashboard Pages
 
-8-page Streamlit app reading directly from the SQLite warehouse:
+`Overview` · `User Analytics` · `Content Performance` · `Monetisation` · `Retention` · `Language Analysis` · `A/B Test` · `SQL Workbench`
 
-`Overview` · `User Analytics` · `Content` · `Monetisation` · `Retention` · `Language` · `A/B Test` · `SQL Workbench` *(the SQL Workbench page lets a reviewer run any of the 15 queries live)*
-
-### Reports & Docs
-
-| File | Purpose |
-|------|---------|
-| [`reports/product_memo.md`](reports/product_memo.md) | **Keystone deliverable.** PM-style memo on the Tier-3/4 monetisation gap with quantified recommendations. |
-| [`reports/metrics_definitions.md`](reports/metrics_definitions.md) | Every metric: formula, SQL, edge cases, common pitfalls. |
-| [`docs/PROJECT_REPORT.md`](docs/PROJECT_REPORT.md) | 2,500-word technical writeup of decisions and trade-offs. |
-| [`docs/SCHEMA_DIAGRAM.md`](docs/SCHEMA_DIAGRAM.md) | Star schema with design rationale (ASCII + Mermaid). |
-| [`docs/DATA_DICTIONARY.md`](docs/DATA_DICTIONARY.md) | Every field in every table. |
-| [`docs/DASHBOARD_GUIDE.md`](docs/DASHBOARD_GUIDE.md) | 5-minute interview demo script. |
-| [`docs/INTERVIEW_PREP.md`](docs/INTERVIEW_PREP.md) | STAR answers, SQL prep, ShareChat context, numbers to memorise. |
+The SQL Workbench page lets a reviewer run any of the 15 queries live against the warehouse.
 
 ---
 
 ## Tech Stack
 
-| Layer | Choice | Why |
-|-------|--------|-----|
-| Data generation | Python + NumPy (vectorised) | ~20s for 3M rows; Faker would have taken 10× longer |
-| API simulation | Python, `requests`-style pattern | Mirrors the "fetch from API" line item in the JD |
-| Warehouse | SQLite | Zero-setup; queries are written in Redshift-compatible SQL throughout |
-| SQL | 15 queries — windows, CTEs, statistical tests | Where the analytical depth lives |
-| Notebooks | pandas, matplotlib, seaborn, scipy | EDA + statistical inference |
-| Dashboard | Streamlit + Plotly | Fast to build, easy to demo, multi-page |
-| Statistics | `scipy.stats` (t-test, chi-square, power) | Proper A/B inference, not eyeballed deltas |
-
----
-
-## Run It
-
-```bash
-# 1. Install
-pip install -r requirements.txt
-
-# 2. Build the warehouse end-to-end (~2-3 min total)
-python src/01_generate_data.py        # ~20s — 2.97M rows → data/raw/
-python src/02_simulate_api_fetch.py   # ~70s — paginate, dedupe, refresh
-python src/03_build_warehouse.py      # ~35s — SQLite star schema (547 MB)
-python src/04_data_quality_checks.py  # ~10s — DQ report
-
-# 3. Launch
-streamlit run dashboard/app.py        # → http://localhost:8501
-
-# Optional
-jupyter lab notebooks/                # explore the analyses
-```
-
----
-
-## Project Structure
-
-```
-sharechat-analytics/
-├── README.md
-├── requirements.txt
-├── assets/                   # logo, brand assets
-├── data/
-│   ├── raw/                  # generated CSVs (gitignored)
-│   └── warehouse/            # SQLite DB + DQ report (gitignored)
-├── src/                      # 4-script pipeline
-├── sql/                      # 15 Redshift-compatible queries + README
-├── notebooks/                # EDA, A/B deep-dive, creator analysis
-├── dashboard/                # 8-page Streamlit app
-├── reports/                  # product memo + metrics dictionary
-└── docs/                     # schema, data dictionary, interview prep
-```
+| Layer | Choice |
+|-------|--------|
+| Data generation | Python + NumPy (vectorised) — ~20s for 3M rows |
+| Warehouse | SQLite with WAL mode, 256MB mmap, permanent in-process cache |
+| SQL | 15 queries — window functions, CTEs, statistical computation |
+| Backend | FastAPI + uvicorn |
+| Frontend | React 18 + Vite + TypeScript + Tailwind CSS + Recharts |
+| Notebooks | pandas, matplotlib, seaborn, scipy |
+| Statistics | `scipy.stats` (t-test, chi-square, power analysis) |
 
 ---
 
@@ -216,12 +221,12 @@ sharechat-analytics/
 | JD requirement | Where it shows up |
 |----------------|-------------------|
 | SQL on a Redshift analytical engine | `sql/01–15_*.sql` — all Redshift-compatible |
-| Scripting to fetch from API endpoints | `src/02_simulate_api_fetch.py` |
-| Working with large user-behaviour data | 2M+ event rows, joined across the schema |
+| Scripting to fetch from API endpoints | `pipeline/02_simulate_api_fetch.py` |
+| Working with large user-behaviour data | 2M+ event rows across a star schema |
 | Trend & pattern recognition | `sql/08_anomaly_detection.sql`, `sql/13_festival_impact.sql` |
-| Segmentation | Tiering, RFM-style, language-cluster analysis |
+| Segmentation | City tier, language, device class, RFM-style creator tiers |
 | Statistics | `notebooks/02_ab_test_deep_dive.ipynb` |
-| Reporting & presenting findings | `reports/product_memo.md`, dashboard, demo script |
+| Reporting & presenting findings | `reports/product_memo.md`, dashboard, `docs/DASHBOARD_GUIDE.md` |
 
 ---
 
@@ -230,4 +235,4 @@ sharechat-analytics/
 Built as a portfolio project for the **ShareChat Product Analyst Internship**.
 All data is synthetic; behavioural signals are modelled on publicly documented platform dynamics.
 
-[LinkedIn](https://www.linkedin.com/in/alokthedataguy/) · [Portfolio](#) · [Email](alokdeep9925@gmail.com)
+[LinkedIn](https://www.linkedin.com/in/alokthedataguy/) · [Email](mailto:iamadsmart@gmail.com)

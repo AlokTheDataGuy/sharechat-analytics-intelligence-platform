@@ -22,10 +22,16 @@ env/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
+# Frontend build output
+frontend/dist/
+frontend/node_modules/
+
 # Data files (large)
 data/raw/*.csv
 data/warehouse/*.db
 data/warehouse/*.db-journal
+data/warehouse/*.db-shm
+data/warehouse/*.db-wal
 
 # OS
 .DS_Store
@@ -40,5 +46,5 @@ desktop.ini
 # Logs & reports (generated)
 data/warehouse/data_quality_report.txt
 
-# Streamlit cache
-.streamlit/
+# FastAPI / uvicorn
+*.pid
